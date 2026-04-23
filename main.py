@@ -1,6 +1,3 @@
-# train.py — 3D Gaussian Splatting with gsplat backend
-# 1:1 logic parity with graphdeco-inria/gaussian-splatting
-
 import argparse
 import json
 import math, struct, random
@@ -17,11 +14,9 @@ import torchvision.transforms.functional as TF
 from torch import nn
 from gsplat import rasterization
 
-# ─── SH ────────────────────────────────────────────────────────────────────────
 C0 = 0.28209479177387814
 def rgb2sh(rgb): return (rgb - 0.5) / C0
 
-# ─── COLMAP binary readers ─────────────────────────────────────────────────────
 def _rd(f, fmt): return struct.unpack(fmt, f.read(struct.calcsize(fmt)))
 
 def read_cameras_bin(path):
@@ -147,7 +142,6 @@ def scene_extent(cameras):
     centers = np.array([(-c["R"].cpu().numpy().T @ c["T"].cpu().numpy()) for c in cameras])
     return float(np.linalg.norm(centers - centers.mean(0), axis=1).max() * 1.1)
 
-# ─── Gaussian Model ────────────────────────────────────────────────────────────
 class Gaussians:
     def __init__(self, sh_degree=3):
         self.max_sh, self.active_sh = sh_degree, 0
@@ -189,7 +183,6 @@ class Gaussians:
         for g in self.opt.param_groups:
             if g["name"] == "xyz": g["lr"] = lr
 
-    # ── Optimizer-aware tensor ops ────────────────────────────────────────────
     def _prune_opt(self, keep):
         out = {}
         for g in self.opt.param_groups:
@@ -243,7 +236,6 @@ class Gaussians:
             if s is not None: self.opt.state[pn] = s
             self.opacity = pn
 
-    # ── Densification ─────────────────────────────────────────────────────────
     def accumulate_stats(self, info):
         radii = info["radii"].squeeze(0).float()
         # gsplat: [N, 2] ellipse axes; older / other paths may use [N]
@@ -320,7 +312,6 @@ class Gaussians:
         arr = np.array([tuple(r) for r in data], dtype=[(c, "f4") for c in cols])
         PlyData([PlyElement.describe(arr, "vertex")]).write(path)
 
-# ─── Render ────────────────────────────────────────────────────────────────────
 def render(cam, gs, bg):
     vmat = torch.eye(4, device="cuda")
     vmat[:3, :3] = cam["R"]; vmat[:3, 3] = cam["T"]
@@ -336,7 +327,6 @@ def render(cam, gs, bg):
         near_plane=0.01, backgrounds=bg.unsqueeze(0), packed=False)
     return renders[0].permute(2, 0, 1), info
 
-# ─── SSIM ──────────────────────────────────────────────────────────────────────
 _WIN = None
 def _ssim_window():
     global _WIN
@@ -355,7 +345,6 @@ def ssim(a, b):
     ab = F.conv2d(a*b, w, padding=5, groups=3) - ma * mb
     return ((2*ma*mb + C1) * (2*ab + C2) / ((ma**2 + mb**2 + C1) * (sa + sb + C2))).mean()
 
-# ─── Test-set rendering ───────────────────────────────────────────────────────
 @torch.no_grad()
 def save_test_renders(test_cams, gs, bg, model_path, step):
     if not test_cams:
@@ -376,7 +365,6 @@ def save_test_renders(test_cams, gs, bg, model_path, step):
     psnr = sum(psnrs) / len(psnrs)
     print(f"  [iter {step}] test PSNR = {psnr:.2f} dB over {len(psnrs)} views → {out_dir}")
 
-# ─── Training ──────────────────────────────────────────────────────────────────
 def train(args):
     # Grouped conv2d (SSIM) can hit CUDNN_STATUS_NOT_INITIALIZED on some CUDA/cuDNN stacks.
     torch.backends.cudnn.enabled = False
