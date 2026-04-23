@@ -76,6 +76,42 @@ def load_scene(data_dir, resolution=1):
                         "image": TF.to_tensor(img).cuda(), "name": name})
     return cameras, xyz, rgb
 
+def _ls_ray_focus(origins, look_dirs):
+    """Least-squares point closest to all camera principal rays.
+
+    For unit directions d_i and origins o_i, minimizes
+        sum_i || (I - d_i d_i^T) (P - o_i) ||^2
+    Closed form: P = A^{-1} b with A = sum M_i, b = sum M_i o_i, M_i = I - d_i d_i^T.
+    Tikhonov-regularized toward the camera centroid so degenerate (parallel)
+    layouts stay well-posed.
+    """
+    d = look_dirs / (np.linalg.norm(look_dirs, axis=1, keepdims=True) + 1e-12)
+    M = np.eye(3)[None] - d[:, :, None] * d[:, None, :]  # (N, 3, 3)
+    A = M.sum(0)
+    b = np.einsum("nij,nj->i", M, origins)
+    lam = 1e-3 * np.trace(A) / 3.0
+    return np.linalg.solve(A + lam * np.eye(3), b + lam * origins.mean(0))
+
+def _sample_init_points(cameras, num_points, box_frac=0.33, seed=0):
+    """Seed a random cube around the cameras' attention volume.
+
+    Works for any pose-only capture (NeRF synthetic, instant-ngp, nerfstudio, ...).
+    For an r=4 inward-looking sphere (Blender convention) this reproduces
+    INRIA's [-1.3, 1.3]^3 seed cube. For forward-facing / LLFF it centers on
+    where the cameras converge in front of them.
+    """
+    origins = np.stack([(-c["R"].cpu().numpy().T @ c["T"].cpu().numpy()) for c in cameras])
+    # 3rd row of world->cam R is the camera-forward axis in world coords.
+    # Valid for both gsplat +z-forward COLMAP viewmats and our NeRF-after-flip convention.
+    dirs = np.stack([c["R"].cpu().numpy()[2] for c in cameras])
+    focus = _ls_ray_focus(origins, dirs)
+    dist  = float(np.median(np.linalg.norm(origins - focus, axis=1)))
+    r     = box_frac * dist
+    rng   = np.random.default_rng(seed)
+    xyz   = (focus + rng.uniform(-r, r, size=(num_points, 3))).astype(np.float32)
+    rgb   = np.full((num_points, 3), 0.5, dtype=np.float32)
+    return xyz, rgb
+
 def _resolve_image_path(base: Path, file_path: str) -> Path:
     rel = file_path[2:] if file_path.startswith("./") else file_path
     img_path = base / rel
@@ -88,15 +124,19 @@ def _resolve_image_path(base: Path, file_path: str) -> Path:
                 return cand
     raise FileNotFoundError(f"Missing image for frame: {file_path} (tried {img_path})")
 
-def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolution=1, num_points=100_000):
-    """Blender / NeRF-style JSON: camera_angle_x, frames[].transform_matrix, file_path."""
+def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolution=1):
+    """Blender / NeRF-style JSON: camera_angle_x, frames[].transform_matrix, file_path.
+
+    Returns cameras only — pose-only formats have no SFM points to seed from,
+    so the caller should synthesize an init cloud via _sample_init_points().
+    """
     base = Path(data_dir)
     meta_path = base / transforms_file
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
     fovx = float(meta["camera_angle_x"])
     frames = sorted(meta["frames"], key=lambda fr: str(fr["file_path"]))
-    cameras, origins = [], []
+    cameras = []
 
     for fr in frames:
         img_path = _resolve_image_path(base, fr["file_path"])
@@ -120,7 +160,6 @@ def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolutio
         c2w = c2w @ np.diag([1.0, -1.0, -1.0, 1.0])
         w2c = np.linalg.inv(c2w)
         R, T = w2c[:3, :3].astype(np.float32), w2c[:3, 3].astype(np.float32)
-        origins.append(c2w[:3, 3].astype(np.float64))
 
         cameras.append({"R": torch.tensor(R).cuda(),
                         "T": torch.tensor(T, dtype=torch.float32).cuda(),
@@ -128,15 +167,7 @@ def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolutio
                         "W": int(w), "H": int(h),
                         "image": TF.to_tensor(img).cuda(), "name": img_path.name})
 
-    origins = np.stack(origins, axis=0)
-    lo, hi = origins.min(0), origins.max(0)
-    diag = float(np.linalg.norm(hi - lo)) + 1e-6
-    margin = 0.25 * diag
-    lo, hi = lo - margin, hi + margin
-    rng = np.random.default_rng(0)
-    xyz = rng.uniform(lo, hi, size=(num_points, 3)).astype(np.float32)
-    rgb = np.full((num_points, 3), 0.5, dtype=np.float32)
-    return cameras, xyz, rgb
+    return cameras
 
 def scene_extent(cameras):
     centers = np.array([(-c["R"].cpu().numpy().T @ c["T"].cpu().numpy()) for c in cameras])
@@ -236,7 +267,7 @@ class Gaussians:
             if s is not None: self.opt.state[pn] = s
             self.opacity = pn
 
-    def accumulate_stats(self, info):
+    def accumulate_stats(self, info, W, H):
         radii = info["radii"].squeeze(0).float()
         # gsplat: [N, 2] ellipse axes; older / other paths may use [N]
         if radii.dim() == 1:
@@ -246,7 +277,13 @@ class Gaussians:
             vis = (radii > 0).all(dim=-1)
             r2d = radii.max(dim=-1).values
         self.max_r2d[vis] = torch.maximum(self.max_r2d[vis], r2d[vis])
-        g2d = info["means2d"].grad.squeeze(0)
+        # gsplat returns means2d in pixel coords, so .grad is in 1/pixel units.
+        # INRIA's densify_grad_threshold (0.0002) was tuned on NDC-space grads,
+        # which are W/2 (resp. H/2) larger. Rescale here so the threshold has
+        # the same meaning as in INRIA / gsplat's DefaultStrategy.
+        g2d = info["means2d"].grad.squeeze(0).clone()
+        g2d[..., 0] *= 0.5 * W
+        g2d[..., 1] *= 0.5 * H
         self.grad_accum[vis] += g2d[vis].norm(dim=-1, keepdim=True)
         self.denom[vis]      += 1
 
@@ -370,24 +407,23 @@ def train(args):
     torch.backends.cudnn.enabled = False
     torch.backends.cudnn.benchmark = False
     print("Loading scene …")
+    # COLMAP ships real SFM points; pose-only formats (NeRF synthetic, instant-ngp,
+    # nerfstudio, ...) return cameras only and the shared _sample_init_points
+    # helper seeds an init cube from camera geometry — no format-specific constants.
     if args.scene == "nerf":
-        cameras, xyz, rgb = load_scene_nerf(
-            args.source_path,
-            transforms_file=args.nerf_transforms,
-            resolution=args.resolution,
-            num_points=args.nerf_num_points,
-        )
+        cameras = load_scene_nerf(args.source_path,
+                                  transforms_file=args.nerf_transforms,
+                                  resolution=args.resolution)
+        xyz, rgb = _sample_init_points(cameras, args.init_num_points, args.init_box_frac)
     elif args.scene == "colmap":
         cameras, xyz, rgb = load_scene(args.source_path, args.resolution)
     else:
         nerf_json = Path(args.source_path) / args.nerf_transforms
         if nerf_json.is_file():
-            cameras, xyz, rgb = load_scene_nerf(
-                args.source_path,
-                transforms_file=args.nerf_transforms,
-                resolution=args.resolution,
-                num_points=args.nerf_num_points,
-            )
+            cameras = load_scene_nerf(args.source_path,
+                                      transforms_file=args.nerf_transforms,
+                                      resolution=args.resolution)
+            xyz, rgb = _sample_init_points(cameras, args.init_num_points, args.init_box_frac)
         else:
             cameras, xyz, rgb = load_scene(args.source_path, args.resolution)
     ext = scene_extent(cameras)
@@ -434,11 +470,12 @@ def train(args):
                 save_test_renders(test_cams, gs, bg, args.model_path, step)
 
             if step < args.densify_until_iter:
-                gs.accumulate_stats(info)
+                gs.accumulate_stats(info, cam["W"], cam["H"])
                 if step > args.densify_from_iter and step % args.densification_interval == 0:
                     gs.densify_and_prune(ext, args, step)
-                if (step % args.opacity_reset_interval == 0
-                        or (args.white_background and step == args.densify_from_iter)):
+                # INRIA's extra reset at densify_from_iter for white_background scenes
+                # accelerates collapse on NeRF synthetic
+                if step % args.opacity_reset_interval == 0:
                     gs.reset_opacity()
 
         gs.opt.step()
@@ -463,7 +500,19 @@ if __name__ == "__main__":
         help="auto: use NeRF JSON if --nerf_transforms exists under source_path, else COLMAP",
     )
     p.add_argument("--nerf_transforms", type=str, default="transforms_train.json")
-    p.add_argument("--nerf_num_points", type=int, default=100_000)
+    p.add_argument(
+        "--init_num_points",
+        type=int,
+        default=100_000,
+        help="Seed count for pose-only formats (ignored for COLMAP, which uses SFM points).",
+    )
+    p.add_argument(
+        "--init_box_frac",
+        type=float,
+        default=0.33,
+        help="Seed-cube half-side as a fraction of median camera-to-focus distance "
+             "(reproduces INRIA's 1.3 for NeRF synthetic's r=4 sphere).",
+    )
     p.add_argument("--model_path", type=str, default="./output")
     p.add_argument("--resolution", type=int, default=1)
     p.add_argument("--llffhold", type=int, default=8)
