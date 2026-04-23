@@ -88,8 +88,15 @@ def _resolve_image_path(base: Path, file_path: str) -> Path:
                 return cand
     raise FileNotFoundError(f"Missing image for frame: {file_path} (tried {img_path})")
 
-def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolution=1, num_points=100_000):
-    """Blender / NeRF-style JSON: camera_angle_x, frames[].transform_matrix, file_path."""
+def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolution=1,
+                    num_points=100_000, init_radius=1.3):
+    """Blender / NeRF-style JSON: camera_angle_x, frames[].transform_matrix, file_path.
+
+    Seeds a random point cloud in [-init_radius, init_radius]^3 — NeRF synthetic
+    scenes are normalized so the object fits inside the unit cube, so ~1.3 keeps
+    seed density concentrated on/near the object instead of sprayed across a
+    camera-origin bbox that's ~15x too large.
+    """
     base = Path(data_dir)
     meta_path = base / transforms_file
     with open(meta_path, encoding="utf-8") as f:
@@ -128,13 +135,12 @@ def load_scene_nerf(data_dir, transforms_file="transforms_train.json", resolutio
                         "W": int(w), "H": int(h),
                         "image": TF.to_tensor(img).cuda(), "name": img_path.name})
 
-    origins = np.stack(origins, axis=0)
-    lo, hi = origins.min(0), origins.max(0)
-    diag = float(np.linalg.norm(hi - lo)) + 1e-6
-    margin = 0.25 * diag
-    lo, hi = lo - margin, hi + margin
+    # NeRF synthetic cameras sit on a sphere ~r=4 around a unit-cube object.
+    # Using the camera-origin bbox as the init volume makes ~99.97% of seeds
+    # land in empty space, so densification has essentially nothing to grow.
     rng = np.random.default_rng(0)
-    xyz = rng.uniform(lo, hi, size=(num_points, 3)).astype(np.float32)
+    r = float(init_radius)
+    xyz = rng.uniform(-r, r, size=(num_points, 3)).astype(np.float32)
     rgb = np.full((num_points, 3), 0.5, dtype=np.float32)
     return cameras, xyz, rgb
 
@@ -376,6 +382,7 @@ def train(args):
             transforms_file=args.nerf_transforms,
             resolution=args.resolution,
             num_points=args.nerf_num_points,
+            init_radius=args.nerf_init_radius,
         )
     elif args.scene == "colmap":
         cameras, xyz, rgb = load_scene(args.source_path, args.resolution)
@@ -387,6 +394,7 @@ def train(args):
                 transforms_file=args.nerf_transforms,
                 resolution=args.resolution,
                 num_points=args.nerf_num_points,
+                init_radius=args.nerf_init_radius,
             )
         else:
             cameras, xyz, rgb = load_scene(args.source_path, args.resolution)
@@ -437,8 +445,9 @@ def train(args):
                 gs.accumulate_stats(info)
                 if step > args.densify_from_iter and step % args.densification_interval == 0:
                     gs.densify_and_prune(ext, args, step)
-                if (step % args.opacity_reset_interval == 0
-                        or (args.white_background and step == args.densify_from_iter)):
+                # INRIA's extra reset at densify_from_iter for white_background scenes
+                # accelerates collapse on NeRF synthetic
+                if step % args.opacity_reset_interval == 0:
                     gs.reset_opacity()
 
         gs.opt.step()
@@ -464,6 +473,12 @@ if __name__ == "__main__":
     )
     p.add_argument("--nerf_transforms", type=str, default="transforms_train.json")
     p.add_argument("--nerf_num_points", type=int, default=100_000)
+    p.add_argument(
+        "--nerf_init_radius",
+        type=float,
+        default=1.3,
+        help="Half-side of the [-r, r]^3 seed cube for NeRF-synthetic init (INRIA default 1.3).",
+    )
     p.add_argument("--model_path", type=str, default="./output")
     p.add_argument("--resolution", type=int, default=1)
     p.add_argument("--llffhold", type=int, default=8)
@@ -481,7 +496,7 @@ if __name__ == "__main__":
     p.add_argument("--densify_from_iter", type=int, default=500)
     p.add_argument("--densify_until_iter", type=int, default=15_000)
     p.add_argument("--densification_interval", type=int, default=100)
-    p.add_argument("--densify_grad_threshold", type=float, default=0.0002)
+    p.add_argument("--densify_grad_threshold", type=float, default=0.0001)
     p.add_argument("--percent_dense", type=float, default=0.01)
     p.add_argument("--min_opacity", type=float, default=0.005)
     p.add_argument("--opacity_reset_interval", type=int, default=3000)
