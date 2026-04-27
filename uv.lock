@@ -2407,7 +2407,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "gsplat" },
-    { name = "imageio" },
     { name = "lpips" },
     { name = "matplotlib" },
     { name = "nerfview" },
@@ -2429,7 +2428,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "gsplat", specifier = ">=1.5.3" },
-    { name = "imageio", specifier = ">=2.37.3" },
     { name = "lpips", specifier = ">=0.1.4" },
     { name = "matplotlib", specifier = ">=3.8" },
     { name = "nerfview", specifier = ">=0.0.3" },
